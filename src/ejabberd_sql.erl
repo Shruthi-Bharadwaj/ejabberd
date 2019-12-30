@@ -44,6 +44,8 @@
 	 escape_like/1,
 	 escape_like_arg/1,
 	 escape_like_arg_circumflex/1,
+         to_string_literal/2,
+         to_string_literal_t/1,
 	 to_bool/1,
 	 sqlite_db/1,
 	 sqlite_file/1,
@@ -250,6 +252,21 @@ to_list(EscapeFun, Val) ->
 to_array(EscapeFun, Val) ->
     Escaped = lists:join(<<",">>, lists:map(EscapeFun, Val)),
     [<<"{">>, Escaped, <<"}">>].
+
+to_string_literal(odbc, S) ->
+    <<"'", (escape(S))/binary, "'">>;
+to_string_literal(mysql, S) ->
+    <<"'", (escape(S))/binary, "'">>;
+to_string_literal(mssql, S) ->
+    <<"'", (standard_escape(S))/binary, "'">>;
+to_string_literal(sqlite, S) ->
+    <<"'", (standard_escape(S))/binary, "'">>;
+to_string_literal(pgsql, S) ->
+    <<"E'", (escape(S))/binary, "'">>.
+
+to_string_literal_t(S) ->
+    State = get(?STATE_KEY),
+    to_string_literal(State#state.db_type, S).
 
 encode_term(Term) ->
     escape(list_to_binary(
@@ -583,14 +600,23 @@ sql_query_internal(#sql_query{} = Query) ->
                     Key = {?PREPARE_KEY, Query#sql_query.hash},
                     case get(Key) of
                         undefined ->
-                            case pgsql_prepare(Query, State) of
-                                {ok, _, _, _} ->
-                                    put(Key, prepared);
-                                {error, Error} ->
-                                    ?ERROR_MSG("PREPARE failed for SQL query "
+                            Host = State#state.host,
+                            PreparedStatements =
+                                ejabberd_option:sql_prepared_statements(Host),
+                            case PreparedStatements of
+                                false ->
+                                    put(Key, ignore);
+                                true ->
+                                    case pgsql_prepare(Query, State) of
+                                        {ok, _, _, _} ->
+                                            put(Key, prepared);
+                                        {error, Error} ->
+                                            ?ERROR_MSG(
+                                               "PREPARE failed for SQL query "
                                                "at ~p: ~p",
                                                [Query#sql_query.loc, Error]),
-                                    put(Key, ignore)
+                                            put(Key, ignore)
+                                    end
                             end;
                         _ ->
                             ok
@@ -599,7 +625,7 @@ sql_query_internal(#sql_query{} = Query) ->
                         prepared ->
                             pgsql_execute_sql_query(Query, State);
                         _ ->
-                            generic_sql_query(Query)
+                            pgsql_sql_query(Query)
                     end;
                 mysql ->
                     generic_sql_query(Query);
@@ -693,6 +719,24 @@ generic_escape() ->
                              (false) -> <<"0">>
                           end,
 		in_array_string = fun(X) -> <<"'", (escape(X))/binary, "'">> end
+               }.
+
+pgsql_sql_query(SQLQuery) ->
+    sql_query_format_res(
+      sql_query_internal(pgsql_sql_query_format(SQLQuery)),
+      SQLQuery).
+
+pgsql_sql_query_format(SQLQuery) ->
+    Args = (SQLQuery#sql_query.args)(pgsql_escape()),
+    (SQLQuery#sql_query.format_query)(Args).
+
+pgsql_escape() ->
+    #sql_escape{string = fun(X) -> <<"E'", (escape(X))/binary, "'">> end,
+		integer = fun(X) -> misc:i2l(X) end,
+		boolean = fun(true) -> <<"1">>;
+                             (false) -> <<"0">>
+                          end,
+		in_array_string = fun(X) -> <<"E'", (escape(X))/binary, "'">> end
                }.
 
 sqlite_sql_query(SQLQuery) ->
